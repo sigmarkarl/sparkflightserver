@@ -7,69 +7,52 @@ import org.apache.arrow.vector.VectorLoader;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.VectorUnloader;
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
-import org.apache.spark.api.java.JavaSparkContext;
-import org.apache.spark.sql.Encoders;
-import org.apache.spark.sql.SparkSession;
-import org.apache.spark.sql.catalyst.InternalRow;
-import org.apache.spark.sql.types.StructType;
-import org.apache.spark.unsafe.types.UTF8String;
-import scala.collection.JavaConverters;
-import scala.collection.Seq;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
+import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.SynchronousQueue;
 
 public class SparkAppProducer extends NoOpFlightProducer implements AutoCloseable {
     private final BufferAllocator                          allocator;
     private final Location                                 location;
-    private final ConcurrentMap<FlightDescriptor, Dataset> datasets;
-    private final SparkSession                             sparkSession;
-    private final StructType                               sparkSchema;
-    private final JavaSparkContext                         sparkContext;
-    public SparkAppProducer(SparkSession sparkSession, StructType sparkSchema, BufferAllocator allocator, Location location) {
+    private final ConcurrentMap<FlightDescriptor, Dataset>       datasets;
+    private final Map<String,SynchronousQueue<ArrowRecordBatch>> queue = new ConcurrentHashMap<>();
+    public SparkAppProducer(BufferAllocator allocator, Location location) {
         this.allocator = allocator;
         this.location = location;
         this.datasets = new ConcurrentHashMap<>();
-        this.sparkSession = sparkSession;
-        this.sparkSchema = sparkSchema;
-        this.sparkContext = new JavaSparkContext(sparkSession.sparkContext());
     }
     @Override
     public Runnable acceptPut(CallContext context, FlightStream flightStream, StreamListener<PutResult> ackStream) {
-        List<ArrowRecordBatch> batches = new ArrayList<>();
+        var batches = new ArrayList<>();
+        var path = flightStream.getDescriptor().getPath().get(0);
+        var queue = this.queue.computeIfAbsent(path, s -> new SynchronousQueue<>());
         return () -> {
             long rows = 0;
             VectorUnloader unloader;
-            var pythonCodeList = new ArrayList<String>();
             while (flightStream.next()) {
                 unloader = new VectorUnloader(flightStream.getRoot());
                 final ArrowRecordBatch arb = unloader.getRecordBatch();
-                var pythonCode = StandardCharsets.UTF_8.decode(arb.getBuffers().get(2).nioBuffer()).toString();
-                pythonCodeList.add(pythonCode);
+                try {
+                    System.err.println("current thread " + Thread.currentThread().getName());
+                    queue.put(arb);
+                }
+                catch (InterruptedException e) {
+                    throw new RuntimeException(e);
+                }
                 batches.add(arb);
                 rows += flightStream.getRoot().getRowCount();
             }
-            var javaRDD = sparkContext.parallelize(pythonCodeList).map(s -> {
-                var utf8Str = UTF8String.fromString(s);
-                var seq = JavaConverters.asScalaIteratorConverter(Collections.singletonList(utf8Str).iterator()).asScala().toSeq();
-                var oseq = (Seq<Object>)(Seq)seq;
-                return InternalRow.apply(oseq);
-            });
 
-            var ds = sparkSession.internalCreateDataFrame(javaRDD.rdd(), sparkSchema, true);
-            try {
-                SparkFlightSource.queue.put(ds);
-            }
-            catch (InterruptedException e) {
-                throw new RuntimeException(e);
-            }
-
-            Dataset dataset = new Dataset(batches, flightStream.getSchema(), rows);
-            datasets.put(flightStream.getDescriptor(), dataset);
+            //System.err.println("done accept");
+            //Dataset dataset = new Dataset(batches, flightStream.getSchema(), rows);
+            //datasets.put(flightStream.getDescriptor(), dataset);
 
             ackStream.onCompleted();
         };
@@ -77,21 +60,34 @@ public class SparkAppProducer extends NoOpFlightProducer implements AutoCloseabl
 
     @Override
     public void getStream(CallContext context, Ticket ticket, ServerStreamListener listener) {
-        FlightDescriptor flightDescriptor = FlightDescriptor.path(
-                new String(ticket.getBytes(), StandardCharsets.UTF_8));
-        Dataset dataset = this.datasets.get(flightDescriptor);
+        //FlightDescriptor flightDescriptor = FlightDescriptor.path(
+        //        new String(ticket.getBytes(), StandardCharsets.UTF_8));
+        /*Dataset dataset = this.datasets.get(flightDescriptor);
         if (dataset == null) {
             throw CallStatus.NOT_FOUND.withDescription("Unknown descriptor").toRuntimeException();
-        }
+        }*/
+        var path = new String(ticket.getBytes(), StandardCharsets.UTF_8);
+        var queue = this.queue.computeIfAbsent(path, s -> new SynchronousQueue<>());
+        Schema schema = new Schema(Arrays.asList(
+                new Field("type", FieldType.nullable(new ArrowType.Utf8()), null), new Field("query", FieldType.nullable(new ArrowType.Utf8()), null), new Field("config", FieldType.nullable(new ArrowType.Utf8()), null)));
         try (VectorSchemaRoot root = VectorSchemaRoot.create(
-                this.datasets.get(flightDescriptor).getSchema(), allocator)) {
+                schema, allocator)) {
             VectorLoader loader = new VectorLoader(root);
             listener.start(root);
-            for (ArrowRecordBatch arrowRecordBatch : this.datasets.get(flightDescriptor).getBatches()) {
-                loader.load(arrowRecordBatch);
+            while(true) {
+                var pythonCode = queue.take();
+                System.err.println("receive " + Thread.currentThread().getId());
+                loader.load(pythonCode);
                 listener.putNext();
             }
-            listener.completed();
+            /*for (ArrowRecordBatch arrowRecordBatch : this.datasets.get(flightDescriptor).getBatches()) {
+                loader.load(arrowRecordBatch);
+                listener.putNext();
+            }*/
+            //listener.completed();
+        }
+        catch (InterruptedException e) {
+            throw new RuntimeException(e);
         }
     }
 
