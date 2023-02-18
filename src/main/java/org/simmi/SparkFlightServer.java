@@ -21,19 +21,15 @@ public class SparkFlightServer implements AutoCloseable {
     }
     public static void main(String[] args) throws Exception {
         try (var sparkFlightServer = new SparkFlightServer(); BufferAllocator allocator = new RootAllocator()) {
-            try (FlightServer flightServer = FlightServer.builder(allocator, location,
-                                                                  new SparkAppProducer(allocator, location))
-                                                         .build()) {
+            try (FlightServer flightServer = FlightServer.builder(allocator, location, new SparkAppProducer(allocator, location)).build()) {
                 try {
                     flightServer.start();
                     System.out.println("S1: Server (Location): Listening on port " + flightServer.getPort());
                     flightServer.awaitTermination();
-                }
-                catch (IOException e) {
+                } catch (IOException e) {
                     e.printStackTrace();
                 }
-            }
-            catch (InterruptedException e) {
+            } catch (InterruptedException e) {
                 throw new RuntimeException(e);
             }
         }

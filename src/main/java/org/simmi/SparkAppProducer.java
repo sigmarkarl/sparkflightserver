@@ -1,5 +1,6 @@
 package org.simmi;
 
+import io.kubernetes.client.openapi.ApiException;
 import org.apache.arrow.flight.*;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.util.AutoCloseables;
@@ -12,6 +13,7 @@ import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -23,6 +25,9 @@ public class SparkAppProducer extends NoOpFlightProducer implements AutoCloseabl
     private final Location                                 location;
     private final ConcurrentMap<FlightDescriptor, Dataset>       datasets;
     private final Map<String,SynchronousQueue<ArrowRecordBatch>> queue = new ConcurrentHashMap<>();
+    private final Schema schema = new Schema(Arrays.asList(
+            new Field("type", FieldType.nullable(new ArrowType.Utf8()), null), new Field("query", FieldType.nullable(new ArrowType.Utf8()), null), new Field("config", FieldType.nullable(new ArrowType.Utf8()), null)));
+
     public SparkAppProducer(BufferAllocator allocator, Location location) {
         this.allocator = allocator;
         this.location = location;
@@ -37,13 +42,22 @@ public class SparkAppProducer extends NoOpFlightProducer implements AutoCloseabl
             long rows = 0;
             VectorUnloader unloader;
             while (flightStream.next()) {
-                unloader = new VectorUnloader(flightStream.getRoot());
+                var vectorSchemaRoot = flightStream.getRoot();
+                unloader = new VectorUnloader(vectorSchemaRoot);
                 final ArrowRecordBatch arb = unloader.getRecordBatch();
+
                 try {
+                    if (!this.queue.containsKey(path)) {
+                        var config = vectorSchemaRoot.getVector("config");
+                        var sparkAppLauncher = new SparkAppLauncher();
+                        for (int i = 0; i < config.getBufferSize(); i++) {
+                            var yaml = config.getObject(i);
+                            sparkAppLauncher.launchSparkApplicationCRD(yaml.toString());
+                        }
+                    }
                     System.err.println("current thread " + Thread.currentThread().getName());
                     queue.put(arb);
-                }
-                catch (InterruptedException e) {
+                } catch (InterruptedException | IOException | ApiException e) {
                     throw new RuntimeException(e);
                 }
                 batches.add(arb);
@@ -68,8 +82,6 @@ public class SparkAppProducer extends NoOpFlightProducer implements AutoCloseabl
         }*/
         var path = new String(ticket.getBytes(), StandardCharsets.UTF_8);
         var queue = this.queue.computeIfAbsent(path, s -> new SynchronousQueue<>());
-        Schema schema = new Schema(Arrays.asList(
-                new Field("type", FieldType.nullable(new ArrowType.Utf8()), null), new Field("query", FieldType.nullable(new ArrowType.Utf8()), null), new Field("config", FieldType.nullable(new ArrowType.Utf8()), null)));
         try (VectorSchemaRoot root = VectorSchemaRoot.create(
                 schema, allocator)) {
             VectorLoader loader = new VectorLoader(root);
